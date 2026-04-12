@@ -274,8 +274,8 @@ def download_csv(df):
     return f'<a href="data:file/csv;base64,{b64}" download="sim_data.csv">📥 Download simulated data (CSV)</a>'
 
 
-def plot_wigner(W, xvec, pvec, title="Wigner Distribution"):
-    """Return a Plotly heatmap figure for a Wigner distribution."""
+def plot_wigner_2d(W, xvec, pvec, title="Wigner Distribution"):
+    """Return a Plotly heatmap (2D) for a Wigner distribution."""
     fig = go.Figure(
         go.Heatmap(
             z=W,
@@ -290,9 +290,50 @@ def plot_wigner(W, xvec, pvec, title="Wigner Distribution"):
         title=title,
         xaxis_title="x (quadrature)",
         yaxis_title="p (quadrature)",
-        height=500,
+        height=520,
     )
     return fig
+
+
+def plot_wigner_3d(W, xvec, pvec, title="Wigner Distribution"):
+    """Return a Plotly surface (3D) for a Wigner distribution."""
+    # Build per-cell colour mapped to sign for the RdBu palette
+    w_norm = (W - W.min()) / (W.max() - W.min() + 1e-30)   # 0-1 for colorscale
+    fig = go.Figure(
+        go.Surface(
+            z=W,
+            x=xvec,
+            y=pvec,
+            surfacecolor=W,
+            colorscale="RdBu_r",
+            cmid=0,
+            colorbar=dict(title="W(x,p)"),
+            contours=dict(
+                z=dict(show=True, usecolormap=True, highlightcolor="white", project_z=False)
+            ),
+        )
+    )
+    fig.update_layout(
+        title=title,
+        scene=dict(
+            xaxis_title="x (quadrature)",
+            yaxis_title="p (quadrature)",
+            zaxis_title="W(x,p)",
+            camera=dict(eye=dict(x=1.6, y=1.6, z=1.0)),
+            aspectmode="manual",
+            aspectratio=dict(x=1, y=1, z=0.55),
+        ),
+        height=600,
+        margin=dict(l=0, r=0, b=0, t=40),
+    )
+    return fig
+
+
+def plot_wigner(W, xvec, pvec, title="Wigner Distribution", mode="2D"):
+    """Dispatcher: returns 2D or 3D Plotly figure."""
+    if mode == "3D":
+        return plot_wigner_3d(W, xvec, pvec, title)
+    return plot_wigner_2d(W, xvec, pvec, title)
 
 
 # ─────────────────────────────────────────────
@@ -411,7 +452,10 @@ if W is not None and apply_loss and eta < 1.0:
 # ────────────────────────────────────────────
 with tabs[0]:
     if W is not None and xvec is not None:
-        fig = plot_wigner(W, xvec, pvec, title=title)
+        plot_mode_main = st.radio(
+            "Plot style", ["2D", "3D"], horizontal=True, key="main_plot_mode"
+        )
+        fig = plot_wigner(W, xvec, pvec, title=title, mode=plot_mode_main)
         st.plotly_chart(fig, use_container_width=True)
 
         # Negativity indicator
@@ -458,8 +502,6 @@ with tabs[1]:
                         elec_var=elec_var,
                     )
 
-                    # ── Sinogram ──────────────────────────────────
-                    st.subheader("Sinogram (quadrature histograms)")
                     bins = 64
                     sino = meas_data_2_hist(
                         sim_data,
@@ -470,32 +512,62 @@ with tabs[1]:
                         bins=bins,
                         m=bins,
                     )
-                    fig_sino = px.imshow(
-                        sino,
-                        aspect="auto",
-                        color_continuous_scale="Viridis",
-                        labels={"x": "Quadrature angle index", "y": "Quadrature value"},
-                        title="Sinogram",
-                    )
-                    st.plotly_chart(fig_sino, use_container_width=True)
+                    recon = irad(sino, int(theta_steps))
 
-                    # ── Reconstructed Wigner via inverse Radon ────
-                    if int(theta_steps) >= 4:
-                        st.subheader("Reconstructed Wigner (filtered back-projection)")
-                        with st.spinner("Running inverse Radon…"):
-                            recon = irad(sino, int(theta_steps))
-                            fig_recon = plot_wigner(
-                                recon,
-                                np.linspace(xvec[0], xvec[-1], recon.shape[1]),
-                                np.linspace(xvec[0], xvec[-1], recon.shape[0]),
-                                title="Reconstructed Wigner",
-                            )
-                            st.plotly_chart(fig_recon, use_container_width=True)
-
-                    # ── Download ──────────────────────────────────
-                    thetas_arr = np.repeat(np.linspace(0, 359, int(theta_steps)), int(pts))
-                    df = pd.DataFrame({"theta_deg": thetas_arr, "quadrature": sim_data})
-                    st.markdown(download_csv(df), unsafe_allow_html=True)
+                    # Persist results so radio toggles don't wipe them
+                    st.session_state["sino"] = sino
+                    st.session_state["recon"] = recon
+                    st.session_state["recon_x"] = np.linspace(xvec[0], xvec[-1], recon.shape[1])
+                    st.session_state["recon_p"] = np.linspace(xvec[0], xvec[-1], recon.shape[0])
+                    st.session_state["sim_data"] = sim_data
+                    st.session_state["theta_steps_done"] = int(theta_steps)
+                    st.session_state["pts_done"] = int(pts)
 
                 except Exception as e:
                     st.error(f"Simulation error: {e}")
+
+        # ── Render results from session_state (survives radio reruns) ──────
+        if "sino" in st.session_state:
+            sino       = st.session_state["sino"]
+            recon      = st.session_state["recon"]
+            recon_x    = st.session_state["recon_x"]
+            recon_p    = st.session_state["recon_p"]
+            sim_data   = st.session_state["sim_data"]
+            theta_done = st.session_state["theta_steps_done"]
+            pts_done   = st.session_state["pts_done"]
+
+            # ── Sinogram ──────────────────────────────────────────────────
+            st.subheader("Sinogram (quadrature histograms)")
+            fig_sino = px.imshow(
+                sino,
+                aspect="auto",
+                color_continuous_scale="Viridis",
+                labels={"x": "Quadrature angle index", "y": "Quadrature value"},
+                title="Sinogram",
+            )
+            st.plotly_chart(fig_sino, use_container_width=True)
+
+            # ── Reconstructed Wigner ──────────────────────────────────────
+            st.subheader("Reconstructed Wigner (filtered back-projection)")
+            plot_mode_recon = st.radio(
+                "Plot style", ["2D", "3D"], horizontal=True, key="recon_plot_mode"
+            )
+            fig_recon = plot_wigner(
+                recon, recon_x, recon_p,
+                title="Reconstructed Wigner",
+                mode=plot_mode_recon,
+            )
+            st.plotly_chart(fig_recon, use_container_width=True)
+
+            # Summary metrics
+            st.markdown("**Reconstruction summary**")
+            mc1, mc2, mc3 = st.columns(3)
+            recon_neg = float(np.sum(recon[recon < 0]))
+            mc1.metric("Min W(x,p)", f"{recon.min():.4f}")
+            mc2.metric("Max W(x,p)", f"{recon.max():.4f}")
+            mc3.metric("Negativity volume", f"{recon_neg:.4f}")
+
+            # ── Download ──────────────────────────────────────────────────
+            thetas_arr = np.repeat(np.linspace(0, 359, theta_done), pts_done)
+            df = pd.DataFrame({"theta_deg": thetas_arr, "quadrature": sim_data})
+            st.markdown(download_csv(df), unsafe_allow_html=True)
