@@ -1,17 +1,15 @@
 import streamlit as st
-import math
 from scipy.special import genlaguerre, factorial
 import gmpy2
 import numpy as np
-import matplotlib.pyplot as plt
 import plotly.graph_objs as go
 import plotly.express as px
 from scipy.interpolate import interp1d, interp2d
 from scipy.signal import convolve
+from scipy.ndimage import gaussian_filter1d, gaussian_filter
 from skimage import transform
 import pandas as pd
 import base64
-from functools import partial
 
 # ─────────────────────────────────────────────
 # PAGE CONFIG
@@ -30,6 +28,15 @@ def norm_state_vec(v):
     """Normalize a state vector."""
     n = np.linalg.norm(v)
     return v / n if n != 0 else v
+
+
+def negativity_volume(wig, xvec, pvec):
+    """Integrated Wigner negativity: ∫ |min(W, 0)| dx dp."""
+    if wig is None:
+        return 0.0
+    dx = float(np.abs(xvec[1] - xvec[0])) if len(xvec) > 1 else 1.0
+    dp = float(np.abs(pvec[1] - pvec[0])) if len(pvec) > 1 else 1.0
+    return float(np.sum(np.abs(np.minimum(wig, 0.0))) * dx * dp)
 
 
 def coh(n, alpha):
@@ -190,80 +197,97 @@ def wig_loss(wig_dis, eta, xvec, pvec):
     return convolve(scaled, kernel, mode="same")
 
 
-def radon_filter(size):
-    """
-    Ramp filter for filtered back-projection (taken from skimage.transform.iradon source).
-    FIX: renamed from 'filter' to avoid shadowing Python built-in.
-    """
-    n = np.concatenate(
-        (np.arange(1, size / 2 + 1, 2, dtype=int), np.arange(size / 2 - 1, 0, -2, dtype=int))
-    )
-    f = np.zeros(size)
-    f[0] = 0.25
-    f[1::2] = -1 / (np.pi * n) ** 2
-    f_ = np.fft.ifft(f)
-    return np.real(f_[:, np.newaxis] / np.max(f_))
-
-
-def perform_interpolation(arr1, arr2, m=100, x_min=-5, x_max=5, padding=1.0, kind="cubic"):
-    non_zero_indices = np.nonzero(arr1)
-    filtered_arr1 = arr1[non_zero_indices]
-    filtered_arr2 = arr2[non_zero_indices]
-    x_new = np.linspace(padding * x_min, padding * x_max, m)
-    interp_func = interp1d(filtered_arr2, filtered_arr1, kind=kind, bounds_error=False, fill_value=0)
-    return x_new, interp_func(x_new)
-
-
 def meas_data_2_hist(sim_data, theta, data_points, dat_min, dat_max, bins, m=360):
-    full = np.zeros((m, theta))
+    """
+    Build a sinogram from homodyne samples.
+    FIX: use fixed-range PDF histograms directly (no unstable cubic interpolation).
+    """
+    _ = m  # Kept for backward-compatible signature.
+    edges = np.linspace(dat_min, dat_max, bins + 1)
+    full = np.zeros((bins, theta))
     for i in range(theta):
-        a, b = np.histogram(sim_data[i * data_points: (i + 1) * data_points], bins=bins)
-        _, c = perform_interpolation(a, b, m=m, x_min=dat_min, x_max=dat_max)
-        full[:, i] = np.abs(c)[::-1]
+        start, stop = i * data_points, (i + 1) * data_points
+        hist, _ = np.histogram(sim_data[start:stop], bins=edges, density=True)
+        full[:, i] = np.nan_to_num(hist, nan=0.0, posinf=0.0, neginf=0.0)
     return full
 
 
-def irad(hist_2d, thetas):
-    """Inverse Radon (filtered back-projection). FIX: uses renamed radon_filter."""
-    all_thetas = np.linspace(0, 360, thetas)
-    filt = radon_filter(hist_2d.shape[0])
-    filtered_img = np.real(np.fft.ifft(np.fft.fft(hist_2d, axis=0) * filt, axis=0))
-    final_img = np.zeros((hist_2d.shape[0], hist_2d.shape[0]))
-    x_arr = np.arange(hist_2d.shape[0]) - hist_2d.shape[0] // 2
-    x, p = np.mgrid[: hist_2d.shape[0], : hist_2d.shape[0]] - hist_2d.shape[0] // 2
-    for col, theta in enumerate(all_thetas):
-        final_img += partial(
-            np.interp, xp=x_arr, fp=filtered_img[:, col], left=0, right=0
-        )(-x * np.sin(np.deg2rad(theta)) - p * np.cos(np.deg2rad(theta)))
-    return final_img
+def irad(hist_2d, thetas, filter_name="hann", smooth_sigma=1.0, post_smooth_sigma=0.5):
+    """
+    Stable inverse Radon via scikit-image filtered back-projection.
+    FIX: half-turn angular convention [0, 180), optional sinogram smoothing,
+    light post-reconstruction denoising, and sum-based normalisation.
+    """
+    if hist_2d.ndim != 2:
+        raise ValueError("hist_2d must be a 2-D array.")
+    if hist_2d.shape[1] != thetas:
+        raise ValueError("hist_2d column count must match 'thetas'.")
+
+    theta_arr = np.linspace(0.0, 180.0, thetas, endpoint=False)
+    sino = (
+        gaussian_filter1d(hist_2d, sigma=smooth_sigma, axis=0, mode="nearest")
+        if smooth_sigma > 0
+        else hist_2d
+    )
+
+    recon = transform.iradon(
+        sino,
+        theta=theta_arr,
+        filter_name=filter_name,
+        circle=False,
+    )
+    if post_smooth_sigma > 0:
+        recon = gaussian_filter(recon, sigma=post_smooth_sigma)
+
+    # Research-style normalisation requested by user: recon / sum(recon).
+    total = np.sum(recon)
+    if np.abs(total) > 1e-15:
+        return recon / total
+
+    # Fallback guard for pathological near-zero sums.
+    abs_total = np.sum(np.abs(recon))
+    return recon / abs_total if abs_total != 0 else recon
 
 
 def sim_homodyne_data(
     wg, xv, theta_steps=180, ADC_bits=8, pts=100,
     need_elec_noise=True, elec_var=0.3, data_res=10
 ):
-    """Simulate homodyne detector data from a Wigner distribution."""
-    thetas = np.linspace(0, 359, theta_steps)
-    mask = np.array([1 if x % data_res == 0 else 0 for x in range(2 ** ADC_bits * data_res)])
-    all_data = np.zeros(thetas.shape[0] * pts)
-    grid = np.linspace(xv[0], xv[-1], 2 ** ADC_bits * data_res)
+    """
+    Simulate homodyne detector data from a Wigner distribution.
+    FIX: use unique homodyne angles in [0,180), preserve range during rotation,
+    and avoid sparse masked ADC grids that create spurious reconstruction spikes.
+    """
+    _ = data_res  # Kept for backward-compatible signature.
+    theta_steps = int(theta_steps)
+    thetas = np.linspace(0.0, 180.0, theta_steps, endpoint=False)
+    all_data = np.zeros(theta_steps * pts)
+    grid = np.linspace(xv[0], xv[-1], max(2, 2 ** int(ADC_bits)))
 
     for i, t in enumerate(thetas):
-        marginal = transform.rotate(wg, t).sum(0)
-        f = interp1d(xv, marginal, bounds_error=False, fill_value=0)
-        discrete_p = f(grid) * mask
-        total = np.sum(np.abs(discrete_p))
-        if total == 0:
+        rot = transform.rotate(
+            wg,
+            t,
+            resize=False,
+            preserve_range=True,
+            mode="constant",
+            cval=0.0,
+            order=1,
+        )
+        marginal = np.sum(rot, axis=0)
+        f = interp1d(xv, marginal, bounds_error=False, fill_value=0.0)
+        discrete_p = np.clip(f(grid), 0.0, None)
+        total = np.sum(discrete_p)
+        if total <= 0:
             continue
-        discrete_p = np.abs(discrete_p) / total
+        discrete_p = discrete_p / total
         all_data[i * pts: (i + 1) * pts] = np.random.choice(grid, p=discrete_p, size=pts)
 
     if need_elec_noise:
-        elec_f = np.exp(-(xv) ** 2 / elec_var)
-        elec_fun = interp1d(xv, elec_f, bounds_error=False, fill_value=0)
-        elec_p = np.abs(elec_fun(grid) * mask)
+        elec_f = np.exp(-(grid ** 2) / max(elec_var, 1e-12))
+        elec_p = np.abs(elec_f)
         elec_p /= np.sum(elec_p)
-        elec_noise = np.random.choice(grid, p=elec_p, size=thetas.shape[0] * pts)
+        elec_noise = np.random.choice(grid, p=elec_p, size=theta_steps * pts)
         return all_data + elec_noise
     return all_data
 
@@ -459,12 +483,12 @@ with tabs[0]:
         st.plotly_chart(fig, use_container_width=True)
 
         # Negativity indicator
-        neg_vol = float(np.sum(W[W < 0]))
+        neg_vol = negativity_volume(W, xvec, pvec)
         col_a, col_b, col_c = st.columns(3)
         col_a.metric("Min W(x,p)", f"{W.min():.4f}")
         col_b.metric("Max W(x,p)", f"{W.max():.4f}")
         col_c.metric("Negativity volume", f"{neg_vol:.4f}")
-        if neg_vol < -1e-6:
+        if neg_vol > 1e-5:
             st.success("✅ Wigner function has negative regions — non-classical state!")
         else:
             st.info("ℹ️ Wigner function is non-negative — classical-like state.")
@@ -481,8 +505,8 @@ with tabs[1]:
         st.warning("Generate a Wigner distribution first (set parameters above).")
     else:
         col1, col2, col3 = st.columns(3)
-        theta_steps = col1.number_input("Quadrature angles", min_value=4, max_value=360, value=36)
-        pts = col2.number_input("Measurements per angle", min_value=10, max_value=1000, value=100)
+        theta_steps = col1.number_input("Quadrature angles", min_value=4, max_value=360, value=72)
+        pts = col2.number_input("Measurements per angle", min_value=10, max_value=5000, value=400)
         ADC_bits = col3.selectbox("ADC bits", [6, 8, 10, 12], index=1)
 
         st.markdown("**Electronic Noise**")
@@ -562,12 +586,12 @@ with tabs[1]:
             # Summary metrics
             st.markdown("**Reconstruction summary**")
             mc1, mc2, mc3 = st.columns(3)
-            recon_neg = float(np.sum(recon[recon < 0]))
+            recon_neg = negativity_volume(recon, recon_x, recon_p)
             mc1.metric("Min W(x,p)", f"{recon.min():.4f}")
             mc2.metric("Max W(x,p)", f"{recon.max():.4f}")
             mc3.metric("Negativity volume", f"{recon_neg:.4f}")
 
             # ── Download ──────────────────────────────────────────────────
-            thetas_arr = np.repeat(np.linspace(0, 359, theta_done), pts_done)
+            thetas_arr = np.repeat(np.linspace(0.0, 180.0, theta_done, endpoint=False), pts_done)
             df = pd.DataFrame({"theta_deg": thetas_arr, "quadrature": sim_data})
             st.markdown(download_csv(df), unsafe_allow_html=True)
